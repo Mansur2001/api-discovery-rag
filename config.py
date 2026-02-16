@@ -40,6 +40,10 @@ AZURE_AI_KEY = os.getenv("AZURE_AI_KEY", "")
 # Alternative: Use Azure credential for authentication
 USE_AZURE_CREDENTIAL = os.getenv("USE_AZURE_CREDENTIAL", "false").lower() == "true"
 
+# OpenAI API fallback (if Azure AI Foundry doesn't work)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+USE_OPENAI = os.getenv("USE_OPENAI", "false").lower() == "true"
+
 
 def get_api_key(env_key: str) -> str:
     """Get API key from environment or Streamlit secrets."""
