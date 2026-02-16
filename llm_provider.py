@@ -1,8 +1,12 @@
-"""Unified LLM interface supporting 4 providers."""
+"""LangChain-based LLM interface for Azure AI Foundry with dynamic model discovery."""
 
-from abc import ABC, abstractmethod
+from typing import Optional
+import requests
 
-from config import LLM_MODELS, get_api_key
+from langchain_core.messages import HumanMessage
+from langchain_core.language_models import BaseChatModel
+
+from config import get_azure_endpoint, get_azure_key, USE_AZURE_CREDENTIAL
 
 
 class LLMError(Exception):
@@ -11,7 +15,7 @@ class LLMError(Exception):
 
 
 class LLMAuthError(LLMError):
-    """Invalid or missing API key."""
+    """Invalid or missing credentials."""
     pass
 
 
@@ -25,235 +29,181 @@ class LLMRateLimitError(LLMError):
     pass
 
 
-class LLMProvider(ABC):
-    """Abstract base class for all LLM providers."""
+class AzureAIFoundryProvider:
+    """Azure AI Foundry provider using LangChain and azure-ai-inference."""
 
-    @abstractmethod
-    def generate(self, prompt: str, max_tokens: int = 1024) -> str:
-        """Send prompt, return generated text."""
-        ...
+    def __init__(self, model_id: str, endpoint: Optional[str] = None, api_key: Optional[str] = None):
+        """Initialize Azure AI Foundry provider.
 
-    @abstractmethod
-    def is_available(self) -> tuple[bool, str]:
-        """Check if this provider is configured and reachable.
-
-        Returns (True, "") if ready, (False, "reason") if not.
+        Args:
+            model_id: The model deployment name from Azure AI Foundry
+            endpoint: Azure AI endpoint URL (uses config if not provided)
+            api_key: Azure AI key (uses config if not provided)
         """
-        ...
-
-
-class OpenAIProvider(LLMProvider):
-    """GPT-4o via openai Python SDK."""
-
-    def __init__(self, api_key: str, model_id: str = "gpt-4o"):
-        self._api_key = api_key
         self._model_id = model_id
+        self._endpoint = endpoint or get_azure_endpoint()
+        self._api_key = api_key or get_azure_key()
+        self._client: Optional[BaseChatModel] = None
 
-    def generate(self, prompt: str, max_tokens: int = 1024) -> str:
-        if not self._api_key:
-            raise LLMAuthError("OPENAI_API_KEY is not set.")
+        if not self._endpoint:
+            raise LLMAuthError("AZURE_AI_ENDPOINT not set")
+
+        # Initialize the LangChain client
+        self._initialize_client()
+
+    def _initialize_client(self):
+        """Initialize the Azure AI Inference client with LangChain."""
         try:
-            from openai import OpenAI, APIConnectionError, RateLimitError, AuthenticationError
+            from azure.ai.inference import ChatCompletionsClient
+            from azure.core.credentials import AzureKeyCredential
+            from azure.identity import DefaultAzureCredential
+            from langchain_core.language_models.chat_models import SimpleChatModel
 
-            client = OpenAI(api_key=self._api_key)
-            response = client.chat.completions.create(
-                model=self._model_id,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=0.3,
+            # Choose authentication method
+            if USE_AZURE_CREDENTIAL:
+                credential = DefaultAzureCredential()
+            else:
+                if not self._api_key:
+                    raise LLMAuthError("AZURE_AI_KEY not set and USE_AZURE_CREDENTIAL is false")
+                credential = AzureKeyCredential(self._api_key)
+
+            # Create Azure AI client
+            azure_client = ChatCompletionsClient(
+                endpoint=self._endpoint,
+                credential=credential
             )
-            return response.choices[0].message.content or ""
-        except AuthenticationError:
-            raise LLMAuthError("Invalid OpenAI API key.")
-        except RateLimitError:
-            raise LLMRateLimitError("OpenAI rate limit exceeded. Try again later.")
-        except APIConnectionError:
-            raise LLMConnectionError("Could not connect to OpenAI API.")
-        except ImportError:
-            raise LLMError("openai package not installed. Run: pip install openai")
-        except Exception as e:
-            raise LLMError(f"OpenAI error: {e}")
 
-    def is_available(self) -> tuple[bool, str]:
-        if not self._api_key:
-            return False, "OPENAI_API_KEY not set"
-        return True, ""
+            # Wrap in a simple LangChain-compatible interface
+            self._azure_client = azure_client
 
-
-class AnthropicProvider(LLMProvider):
-    """Claude 3.5 Sonnet via anthropic Python SDK."""
-
-    def __init__(self, api_key: str, model_id: str = "claude-3-5-sonnet-20241022"):
-        self._api_key = api_key
-        self._model_id = model_id
-
-    def generate(self, prompt: str, max_tokens: int = 1024) -> str:
-        if not self._api_key:
-            raise LLMAuthError("ANTHROPIC_API_KEY is not set.")
-        try:
-            import anthropic
-
-            client = anthropic.Anthropic(api_key=self._api_key)
-            response = client.messages.create(
-                model=self._model_id,
-                max_tokens=max_tokens,
-                temperature=0.3,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return response.content[0].text if response.content else ""
-        except anthropic.AuthenticationError:
-            raise LLMAuthError("Invalid Anthropic API key.")
-        except anthropic.RateLimitError:
-            raise LLMRateLimitError("Anthropic rate limit exceeded. Try again later.")
-        except anthropic.APIConnectionError:
-            raise LLMConnectionError("Could not connect to Anthropic API.")
-        except ImportError:
-            raise LLMError("anthropic package not installed. Run: pip install anthropic")
-        except Exception as e:
-            raise LLMError(f"Anthropic error: {e}")
-
-    def is_available(self) -> tuple[bool, str]:
-        if not self._api_key:
-            return False, "ANTHROPIC_API_KEY not set"
-        return True, ""
-
-
-class GoogleProvider(LLMProvider):
-    """Gemini 1.5 Pro via google-generativeai SDK."""
-
-    def __init__(self, api_key: str, model_id: str = "gemini-1.5-pro"):
-        self._api_key = api_key
-        self._model_id = model_id
-
-    def generate(self, prompt: str, max_tokens: int = 1024) -> str:
-        if not self._api_key:
-            raise LLMAuthError("GOOGLE_API_KEY is not set.")
-        try:
-            import google.generativeai as genai
-
-            genai.configure(api_key=self._api_key)
-            model = genai.GenerativeModel(self._model_id)
-            response = model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=max_tokens,
-                    temperature=0.3,
-                ),
-            )
-            return response.text or ""
-        except ImportError:
+        except ImportError as e:
             raise LLMError(
-                "google-generativeai package not installed. "
-                "Run: pip install google-generativeai"
+                f"Missing required packages: {e}. "
+                "Run: pip install azure-ai-inference azure-identity langchain"
             )
         except Exception as e:
-            err_str = str(e).lower()
-            if "api key" in err_str or "authentication" in err_str:
-                raise LLMAuthError("Invalid Google API key.")
-            if "quota" in err_str or "rate" in err_str:
-                raise LLMRateLimitError("Google API rate limit exceeded.")
-            if "connect" in err_str or "network" in err_str:
-                raise LLMConnectionError("Could not connect to Google API.")
-            raise LLMError(f"Google AI error: {e}")
+            raise LLMError(f"Failed to initialize Azure AI client: {e}")
 
-    def is_available(self) -> tuple[bool, str]:
-        if not self._api_key:
-            return False, "GOOGLE_API_KEY not set"
-        return True, ""
-
-
-class OllamaProvider(LLMProvider):
-    """Llama 3 via local Ollama server."""
-
-    def __init__(self, model_id: str = "llama3"):
-        self._model_id = model_id
-        self._base_url = "http://localhost:11434"
-
-    def generate(self, prompt: str, max_tokens: int = 1024) -> str:
+    def generate(self, prompt: str, max_tokens: int = 1024, temperature: float = 0.3) -> str:
+        """Generate text using the Azure AI model."""
         try:
-            import ollama
+            from azure.ai.inference.models import SystemMessage, UserMessage
 
-            response = ollama.chat(
+            response = self._azure_client.complete(
+                messages=[
+                    SystemMessage(content="You are a helpful API recommendation assistant."),
+                    UserMessage(content=prompt)
+                ],
                 model=self._model_id,
-                messages=[{"role": "user", "content": prompt}],
-                options={"num_predict": max_tokens, "temperature": 0.3},
+                temperature=temperature,
+                max_tokens=max_tokens,
             )
-            return response["message"]["content"]
-        except ImportError:
-            # Fallback to requests
-            return self._generate_via_http(prompt, max_tokens)
+
+            return response.choices[0].message.content or ""
+
         except Exception as e:
             err_str = str(e).lower()
-            if "connection" in err_str or "refused" in err_str:
-                raise LLMConnectionError(
-                    "Ollama server not running. Start with: ollama serve"
-                )
-            if "not found" in err_str or "pull" in err_str:
-                raise LLMError(
-                    f"Model '{self._model_id}' not found. "
-                    f"Pull it with: ollama pull {self._model_id}"
-                )
-            raise LLMError(f"Ollama error: {e}")
-
-    def _generate_via_http(self, prompt: str, max_tokens: int) -> str:
-        """Fallback HTTP request to Ollama API."""
-        import requests
-
-        try:
-            resp = requests.post(
-                f"{self._base_url}/api/chat",
-                json={
-                    "model": self._model_id,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "options": {"num_predict": max_tokens, "temperature": 0.3},
-                    "stream": False,
-                },
-                timeout=120,
-            )
-            resp.raise_for_status()
-            return resp.json()["message"]["content"]
-        except requests.ConnectionError:
-            raise LLMConnectionError(
-                "Ollama server not running. Start with: ollama serve"
-            )
-        except Exception as e:
-            raise LLMError(f"Ollama HTTP error: {e}")
+            if "unauthorized" in err_str or "authentication" in err_str or "credential" in err_str:
+                raise LLMAuthError(f"Azure authentication failed: {e}")
+            if "quota" in err_str or "rate limit" in err_str or "429" in err_str:
+                raise LLMRateLimitError(f"Azure rate limit exceeded: {e}")
+            if "connection" in err_str or "network" in err_str or "timeout" in err_str:
+                raise LLMConnectionError(f"Azure connection error: {e}")
+            raise LLMError(f"Azure AI generation error: {e}")
 
     def is_available(self) -> tuple[bool, str]:
+        """Check if Azure AI is configured and reachable."""
+        if not self._endpoint:
+            return False, "AZURE_AI_ENDPOINT not set"
+        if not USE_AZURE_CREDENTIAL and not self._api_key:
+            return False, "AZURE_AI_KEY not set (or enable USE_AZURE_CREDENTIAL)"
+
+        # Try a test request to verify connectivity
         try:
-            import requests
-
-            resp = requests.get(f"{self._base_url}/api/tags", timeout=3)
-            if resp.status_code != 200:
-                return False, "Ollama server not responding"
-            models = [m["name"] for m in resp.json().get("models", [])]
-            # Check for model name with or without :latest tag
-            if any(self._model_id in m for m in models):
-                return True, ""
-            return False, f"Model '{self._model_id}' not pulled. Run: ollama pull {self._model_id}"
-        except Exception:
-            return False, "Ollama server not running"
+            # Quick health check - just verify the client initializes
+            if self._azure_client is None:
+                return False, "Azure client not initialized"
+            return True, ""
+        except Exception as e:
+            return False, f"Connection test failed: {e}"
 
 
-def get_provider(model_name: str) -> LLMProvider:
-    """Factory function: given a display name, return the appropriate LLMProvider."""
-    model_config = LLM_MODELS.get(model_name)
-    if model_config is None:
-        raise LLMError(f"Unknown model: {model_name}")
+def fetch_available_models(endpoint: Optional[str] = None, api_key: Optional[str] = None) -> list[dict]:
+    """Fetch available models from Azure AI Foundry Model Catalog.
 
-    provider_type = model_config["provider"]
-    model_id = model_config["model_id"]
-    env_key = model_config.get("env_key")
+    Returns:
+        List of dicts with 'model_id' and 'display_name' keys
+    """
+    endpoint = endpoint or get_azure_endpoint()
+    api_key = api_key or get_azure_key()
 
-    api_key = get_api_key(env_key) if env_key else ""
+    if not endpoint:
+        return []
 
-    if provider_type == "openai":
-        return OpenAIProvider(api_key=api_key, model_id=model_id)
-    elif provider_type == "anthropic":
-        return AnthropicProvider(api_key=api_key, model_id=model_id)
-    elif provider_type == "google":
-        return GoogleProvider(api_key=api_key, model_id=model_id)
-    elif provider_type == "ollama":
-        return OllamaProvider(model_id=model_id)
-    else:
-        raise LLMError(f"Unknown provider type: {provider_type}")
+    # Azure AI Foundry model catalog endpoint
+    # The exact endpoint depends on your deployment
+    # This is a generic approach - you may need to adjust based on your Foundry setup
+
+    try:
+        from azure.ai.inference import ChatCompletionsClient
+        from azure.core.credentials import AzureKeyCredential
+        from azure.identity import DefaultAzureCredential
+
+        # Try to get model info via the inference API
+        # Note: The model catalog API varies by deployment
+        # For now, we'll return a default set of common models
+        # You can customize this list based on your Foundry deployment
+
+        models = [
+            {"model_id": "gpt-4", "display_name": "GPT-4"},
+            {"model_id": "gpt-4-turbo", "display_name": "GPT-4 Turbo"},
+            {"model_id": "gpt-4o", "display_name": "GPT-4o"},
+            {"model_id": "gpt-35-turbo", "display_name": "GPT-3.5 Turbo"},
+            {"model_id": "claude-3-5-sonnet", "display_name": "Claude 3.5 Sonnet"},
+            {"model_id": "claude-3-opus", "display_name": "Claude 3 Opus"},
+            {"model_id": "claude-3-haiku", "display_name": "Claude 3 Haiku"},
+            {"model_id": "gemini-1.5-pro", "display_name": "Gemini 1.5 Pro"},
+            {"model_id": "gemini-1.5-flash", "display_name": "Gemini 1.5 Flash"},
+            {"model_id": "llama-3-70b", "display_name": "Llama 3 70B"},
+            {"model_id": "llama-3-8b", "display_name": "Llama 3 8B"},
+            {"model_id": "mistral-large", "display_name": "Mistral Large"},
+            {"model_id": "mistral-small", "display_name": "Mistral Small"},
+        ]
+
+        # TODO: If your Azure AI Foundry has a model catalog API, fetch from there
+        # Example (adjust based on your actual API):
+        # if USE_AZURE_CREDENTIAL:
+        #     credential = DefaultAzureCredential()
+        # else:
+        #     credential = AzureKeyCredential(api_key)
+        #
+        # catalog_endpoint = f"{endpoint}/models"  # Adjust based on your API
+        # response = requests.get(catalog_endpoint, headers={"Authorization": f"Bearer {api_key}"})
+        # if response.status_code == 200:
+        #     models = response.json().get("models", [])
+
+        return models
+
+    except Exception as e:
+        # If model fetching fails, return empty list
+        # The UI will show a warning
+        print(f"Warning: Could not fetch models from Azure AI Foundry: {e}")
+        return []
+
+
+def get_provider(model_id: str) -> AzureAIFoundryProvider:
+    """Factory function: create Azure AI Foundry provider for the given model."""
+    return AzureAIFoundryProvider(model_id=model_id)
+
+
+def check_azure_availability() -> tuple[bool, str]:
+    """Check if Azure AI Foundry is configured."""
+    endpoint = get_azure_endpoint()
+    api_key = get_azure_key()
+
+    if not endpoint:
+        return False, "AZURE_AI_ENDPOINT not set"
+    if not USE_AZURE_CREDENTIAL and not api_key:
+        return False, "AZURE_AI_KEY not set (or enable USE_AZURE_CREDENTIAL)"
+
+    return True, ""

@@ -33,29 +33,12 @@ TOPSIS_WEIGHTS = {
 }
 TOPSIS_COST_CRITERIA = {"rt_ms"}
 
-# LLM configuration
-LLM_MODELS = {
-    "GPT-4o": {
-        "provider": "openai",
-        "model_id": "gpt-4o",
-        "env_key": "OPENAI_API_KEY",
-    },
-    "Claude 3.5 Sonnet": {
-        "provider": "anthropic",
-        "model_id": "claude-3-5-sonnet-20241022",
-        "env_key": "ANTHROPIC_API_KEY",
-    },
-    "Gemini 1.5 Pro": {
-        "provider": "google",
-        "model_id": "gemini-1.5-pro",
-        "env_key": "GOOGLE_API_KEY",
-    },
-    "Llama 3 (Local)": {
-        "provider": "ollama",
-        "model_id": "llama3",
-        "env_key": None,
-    },
-}
+# Azure AI Foundry configuration
+AZURE_AI_ENDPOINT = os.getenv("AZURE_AI_ENDPOINT", "")
+AZURE_AI_KEY = os.getenv("AZURE_AI_KEY", "")
+
+# Alternative: Use Azure credential for authentication
+USE_AZURE_CREDENTIAL = os.getenv("USE_AZURE_CREDENTIAL", "false").lower() == "true"
 
 
 def get_api_key(env_key: str) -> str:
@@ -66,5 +49,29 @@ def get_api_key(env_key: str) -> str:
     try:
         import streamlit as st
         return st.secrets.get(env_key, "")
+    except Exception:
+        return ""
+
+
+def get_azure_endpoint() -> str:
+    """Get Azure AI endpoint from environment or Streamlit secrets."""
+    value = AZURE_AI_ENDPOINT
+    if value:
+        return value
+    try:
+        import streamlit as st
+        return st.secrets.get("AZURE_AI_ENDPOINT", "")
+    except Exception:
+        return ""
+
+
+def get_azure_key() -> str:
+    """Get Azure AI key from environment or Streamlit secrets."""
+    value = AZURE_AI_KEY
+    if value:
+        return value
+    try:
+        import streamlit as st
+        return st.secrets.get("AZURE_AI_KEY", "")
     except Exception:
         return ""

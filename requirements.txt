@@ -2,9 +2,11 @@ streamlit>=1.31.0
 chromadb>=0.4.22
 sentence-transformers>=2.5.0
 numpy>=1.24.0,<2.0.0
-openai>=1.12.0
-anthropic>=0.18.0
-google-generativeai>=0.4.0
-ollama>=0.1.6
 python-dotenv>=1.0.0
 requests>=2.31.0
+
+# LangChain stack for Azure AI Foundry
+langchain>=0.1.0
+langchain-core>=0.1.0
+azure-ai-inference>=1.0.0b1
+azure-identity>=1.15.0

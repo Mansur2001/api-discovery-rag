@@ -8,7 +8,7 @@ from config import TOPSIS_WEIGHTS, TOPSIS_COST_CRITERIA
 from data_loader import load_all_data, get_categories, build_record_maps
 from vector_store import VectorStore
 from ranker import rank_baseline, rank_qos_aware
-from llm_provider import get_provider, LLMError, LLMAuthError
+from llm_provider import get_provider, fetch_available_models, LLMError, LLMAuthError
 from prompts import build_baseline_prompt, build_qos_aware_prompt
 from ui_components import (
     render_sidebar,
@@ -51,7 +51,7 @@ def init_vector_store(_no_qos_records):
 
 def run_pipeline(
     query: str,
-    model_name: str,
+    model_id: str | None,
     top_k: int,
     category_filter: str | None,
     vector_store: VectorStore,
@@ -61,7 +61,7 @@ def run_pipeline(
     """Execute the full RAG pipeline.
 
     Returns dict with baseline_results, baseline_explanation,
-    qos_results, qos_explanation, model_name.
+    qos_results, qos_explanation, model_id.
     """
     # Stage 2: Retrieval (shared)
     retrieval_results = vector_store.query(query, top_k, category_filter)
@@ -72,7 +72,7 @@ def run_pipeline(
             "baseline_explanation": "",
             "qos_results": [],
             "qos_explanation": "",
-            "model_name": model_name,
+            "model_id": model_id,
         }
 
     # Stage 3: Ranking (two parallel modes)
@@ -83,10 +83,10 @@ def run_pipeline(
 
     # Stage 4: LLM Generation (two calls)
     baseline_explanation = _generate_explanation(
-        model_name, query, baseline_results, mode="baseline"
+        model_id, query, baseline_results, mode="baseline"
     )
     qos_explanation = _generate_explanation(
-        model_name, query, qos_results, mode="qos"
+        model_id, query, qos_results, mode="qos"
     )
 
     return {
@@ -94,22 +94,25 @@ def run_pipeline(
         "baseline_explanation": baseline_explanation,
         "qos_results": qos_results,
         "qos_explanation": qos_explanation,
-        "model_name": model_name,
+        "model_id": model_id,
     }
 
 
 def _generate_explanation(
-    model_name: str,
+    model_id: str | None,
     query: str,
     ranked_results: list,
     mode: str,
 ) -> str:
     """Generate LLM explanation, returning error message on failure."""
+    if model_id is None:
+        return "Azure AI Foundry not configured. Set AZURE_AI_ENDPOINT and AZURE_AI_KEY."
+
     try:
-        provider = get_provider(model_name)
+        provider = get_provider(model_id)
         available, reason = provider.is_available()
         if not available:
-            return f"LLM unavailable: {reason}"
+            return f"Azure AI unavailable: {reason}"
 
         if mode == "baseline":
             prompt = build_baseline_prompt(query, ranked_results)
@@ -119,9 +122,9 @@ def _generate_explanation(
         return provider.generate(prompt)
 
     except LLMAuthError as e:
-        return f"LLM authentication error: {e}"
+        return f"Azure authentication error: {e}"
     except LLMError as e:
-        return f"LLM error: {e}"
+        return f"Azure AI error: {e}"
     except Exception as e:
         return f"Error generating explanation: {e}"
 
@@ -154,8 +157,11 @@ def main():
         )
         st.stop()
 
+    # Fetch available models from Azure AI Foundry
+    available_models = fetch_available_models()
+
     # Render sidebar and get user inputs
-    sidebar = render_sidebar(categories)
+    sidebar = render_sidebar(categories, available_models)
 
     # Header
     st.markdown("# API Discovery Dashboard")
@@ -176,7 +182,7 @@ def main():
             with st.spinner("Searching and ranking APIs..."):
                 results = run_pipeline(
                     query=query,
-                    model_name=sidebar["model_name"],
+                    model_id=sidebar["model_id"],
                     top_k=sidebar["top_k"],
                     category_filter=sidebar["category"],
                     vector_store=vector_store,
@@ -193,7 +199,7 @@ def main():
                     baseline_explanation=results["baseline_explanation"],
                     qos_results=results["qos_results"],
                     qos_explanation=results["qos_explanation"],
-                    model_name=results["model_name"],
+                    model_id=results["model_id"],
                 )
 
         except Exception as e:

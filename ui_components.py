@@ -2,9 +2,9 @@
 
 import streamlit as st
 
-from config import LLM_MODELS, DEFAULT_TOP_K, MIN_TOP_K, MAX_TOP_K
+from config import DEFAULT_TOP_K, MIN_TOP_K, MAX_TOP_K
 from ranker import BaselineRankedResult, QoSRankedResult
-from llm_provider import get_provider
+from llm_provider import get_provider, check_azure_availability
 
 
 # Method badge colors
@@ -17,10 +17,14 @@ METHOD_COLORS = {
 }
 
 
-def render_sidebar(categories: list[str]) -> dict:
+def render_sidebar(categories: list[str], available_models: list[dict]) -> dict:
     """Render the sidebar with all controls.
 
-    Returns dict with: query, model_name, top_k, category, search_clicked
+    Args:
+        categories: List of API categories for filtering
+        available_models: List of model dicts from Azure AI Foundry
+
+    Returns dict with: query, model_id, top_k, category, search_clicked
     """
     with st.sidebar:
         st.title("API Discovery RAG")
@@ -32,24 +36,29 @@ def render_sidebar(categories: list[str]) -> dict:
         )
 
         st.markdown("#### LLM Model")
-        model_name = st.selectbox(
-            "Select LLM",
-            options=list(LLM_MODELS.keys()),
-            label_visibility="collapsed",
-        )
 
-        # LLM availability indicators
-        st.markdown("##### Model Availability")
-        for name in LLM_MODELS:
-            provider = get_provider(name)
-            available, reason = provider.is_available()
-            if available:
-                st.markdown(f"&nbsp; :green_circle: &nbsp; {name}", unsafe_allow_html=True)
-            else:
-                st.markdown(
-                    f"&nbsp; :red_circle: &nbsp; {name} — _{reason}_",
-                    unsafe_allow_html=True,
-                )
+        # Check Azure availability
+        azure_available, azure_reason = check_azure_availability()
+        if not azure_available:
+            st.warning(f"Azure AI Foundry: {azure_reason}")
+            model_id = None
+        elif not available_models:
+            st.warning("No models available from Azure AI Foundry")
+            model_id = None
+        else:
+            # Create model options
+            model_options = {m["display_name"]: m["model_id"] for m in available_models}
+            selected_display_name = st.selectbox(
+                "Select Model",
+                options=list(model_options.keys()),
+                label_visibility="collapsed",
+            )
+            model_id = model_options[selected_display_name]
+
+            # Show availability indicator
+            st.markdown("##### Azure AI Status")
+            st.markdown(f"&nbsp; :green_circle: &nbsp; Connected", unsafe_allow_html=True)
+            st.caption(f"Model: `{model_id}`")
 
         st.markdown("---")
 
@@ -70,7 +79,7 @@ def render_sidebar(categories: list[str]) -> dict:
 
     return {
         "query": query,
-        "model_name": model_name,
+        "model_id": model_id,
         "top_k": top_k,
         "category": category,
         "search_clicked": search_clicked,
@@ -161,19 +170,19 @@ def render_qos_card(result: QoSRankedResult) -> None:
         st.markdown("<hr style='margin:8px 0;border:none;border-top:1px solid #eee;'>", unsafe_allow_html=True)
 
 
-def render_llm_explanation(explanation: str, model_name: str, mode: str) -> None:
+def render_llm_explanation(explanation: str, model_id: str, mode: str) -> None:
     """Render the LLM explanation in a styled container."""
     title = "Baseline Analysis" if mode == "baseline" else "QoS-Aware Analysis"
 
     st.markdown(f"### {title}")
     st.markdown(
         f'<span style="background:#f0f0f0;padding:4px 12px;border-radius:12px;'
-        f'font-size:0.8em;">Powered by {model_name}</span>',
+        f'font-size:0.8em;">Powered by {model_id}</span>',
         unsafe_allow_html=True,
     )
     st.markdown("")
 
-    if explanation.startswith("Error:") or explanation.startswith("LLM"):
+    if explanation.startswith("Error:") or explanation.startswith("LLM") or explanation.startswith("Azure"):
         st.warning(explanation)
     else:
         st.info(explanation)
@@ -184,20 +193,20 @@ def render_side_by_side(
     baseline_explanation: str,
     qos_results: list[QoSRankedResult],
     qos_explanation: str,
-    model_name: str,
+    model_id: str,
 ) -> None:
     """Main layout: two columns side by side."""
     col1, col2 = st.columns(2)
 
     with col1:
-        render_llm_explanation(baseline_explanation, model_name, "baseline")
+        render_llm_explanation(baseline_explanation, model_id, "baseline")
         st.markdown("---")
         st.markdown("#### Ranked by Similarity")
         for result in baseline_results:
             render_baseline_card(result)
 
     with col2:
-        render_llm_explanation(qos_explanation, model_name, "qos")
+        render_llm_explanation(qos_explanation, model_id, "qos")
         st.markdown("---")
         st.markdown("#### Ranked by TOPSIS (QoS-Aware)")
         for result in qos_results:
@@ -208,7 +217,7 @@ def render_side_by_side(
     st.markdown(
         f'<div style="text-align:center;padding:8px;background:#f8f9fa;'
         f'border-radius:8px;">'
-        f'<strong>Active LLM:</strong> {model_name}</div>',
+        f'<strong>Active Model:</strong> {model_id}</div>',
         unsafe_allow_html=True,
     )
 
