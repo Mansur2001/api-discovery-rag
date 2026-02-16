@@ -195,22 +195,87 @@ def render_side_by_side(
     qos_explanation: str,
     model_id: str,
 ) -> None:
-    """Main layout: two columns side by side."""
+    """Main layout: two columns side by side with pagination."""
+    # Pagination settings
+    results_per_page = 5
+
+    # Initialize session state for page numbers if not exists
+    if 'baseline_page' not in st.session_state:
+        st.session_state.baseline_page = 0
+    if 'qos_page' not in st.session_state:
+        st.session_state.qos_page = 0
+
+    # Calculate total pages
+    baseline_total_pages = max(1, (len(baseline_results) + results_per_page - 1) // results_per_page)
+    qos_total_pages = max(1, (len(qos_results) + results_per_page - 1) // results_per_page)
+
+    # Ensure page numbers are within bounds
+    st.session_state.baseline_page = min(st.session_state.baseline_page, baseline_total_pages - 1)
+    st.session_state.qos_page = min(st.session_state.qos_page, qos_total_pages - 1)
+
     col1, col2 = st.columns(2)
 
     with col1:
         render_llm_explanation(baseline_explanation, model_id, "baseline")
         st.markdown("---")
         st.markdown("#### Ranked by Similarity")
-        for result in baseline_results:
+
+        # Get current page results
+        start_idx = st.session_state.baseline_page * results_per_page
+        end_idx = start_idx + results_per_page
+        page_results = baseline_results[start_idx:end_idx]
+
+        for result in page_results:
             render_baseline_card(result)
+
+        # Pagination controls
+        if len(baseline_results) > results_per_page:
+            st.markdown("---")
+            pcol1, pcol2, pcol3 = st.columns([1, 2, 1])
+            with pcol1:
+                if st.button("← Prev", key="baseline_prev", disabled=st.session_state.baseline_page == 0):
+                    st.session_state.baseline_page -= 1
+                    st.rerun()
+            with pcol2:
+                st.markdown(
+                    f'<div style="text-align:center;padding:8px;">Page {st.session_state.baseline_page + 1} of {baseline_total_pages}</div>',
+                    unsafe_allow_html=True
+                )
+            with pcol3:
+                if st.button("Next →", key="baseline_next", disabled=st.session_state.baseline_page >= baseline_total_pages - 1):
+                    st.session_state.baseline_page += 1
+                    st.rerun()
 
     with col2:
         render_llm_explanation(qos_explanation, model_id, "qos")
         st.markdown("---")
         st.markdown("#### Ranked by TOPSIS (QoS-Aware)")
-        for result in qos_results:
+
+        # Get current page results
+        start_idx = st.session_state.qos_page * results_per_page
+        end_idx = start_idx + results_per_page
+        page_results = qos_results[start_idx:end_idx]
+
+        for result in page_results:
             render_qos_card(result)
+
+        # Pagination controls
+        if len(qos_results) > results_per_page:
+            st.markdown("---")
+            pcol1, pcol2, pcol3 = st.columns([1, 2, 1])
+            with pcol1:
+                if st.button("← Prev", key="qos_prev", disabled=st.session_state.qos_page == 0):
+                    st.session_state.qos_page -= 1
+                    st.rerun()
+            with pcol2:
+                st.markdown(
+                    f'<div style="text-align:center;padding:8px;">Page {st.session_state.qos_page + 1} of {qos_total_pages}</div>',
+                    unsafe_allow_html=True
+                )
+            with pcol3:
+                if st.button("Next →", key="qos_next", disabled=st.session_state.qos_page >= qos_total_pages - 1):
+                    st.session_state.qos_page += 1
+                    st.rerun()
 
     # Active LLM indicator
     st.markdown("---")

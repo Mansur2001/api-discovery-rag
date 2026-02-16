@@ -178,6 +178,10 @@ def main():
             st.warning("Please enter a search query.")
             return
 
+        # Reset pagination on new search
+        st.session_state.baseline_page = 0
+        st.session_state.qos_page = 0
+
         try:
             with st.spinner("Searching and ranking APIs..."):
                 results = run_pipeline(
