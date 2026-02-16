@@ -1,10 +1,8 @@
-"""LangChain-based LLM interface for Azure AI Foundry with dynamic model discovery."""
+"""Azure AI Foundry LLM interface with dynamic model discovery."""
 
 from typing import Optional
 import requests
-
-from langchain_core.messages import HumanMessage
-from langchain_core.language_models import BaseChatModel
+import json
 
 from config import get_azure_endpoint, get_azure_key, USE_AZURE_CREDENTIAL
 
@@ -30,7 +28,7 @@ class LLMRateLimitError(LLMError):
 
 
 class AzureAIFoundryProvider:
-    """Azure AI Foundry provider using LangChain and azure-ai-inference."""
+    """Azure AI Foundry provider using direct REST API."""
 
     def __init__(self, model_id: str, endpoint: Optional[str] = None, api_key: Optional[str] = None):
         """Initialize Azure AI Foundry provider.
@@ -43,72 +41,81 @@ class AzureAIFoundryProvider:
         self._model_id = model_id
         self._endpoint = endpoint or get_azure_endpoint()
         self._api_key = api_key or get_azure_key()
-        self._client: Optional[BaseChatModel] = None
 
         if not self._endpoint:
             raise LLMAuthError("AZURE_AI_ENDPOINT not set")
-
-        # Initialize the LangChain client
-        self._initialize_client()
-
-    def _initialize_client(self):
-        """Initialize the Azure AI Inference client with LangChain."""
-        try:
-            from azure.ai.inference import ChatCompletionsClient
-            from azure.core.credentials import AzureKeyCredential
-            from azure.identity import DefaultAzureCredential
-            from langchain_core.language_models.chat_models import SimpleChatModel
-
-            # Choose authentication method
-            if USE_AZURE_CREDENTIAL:
-                credential = DefaultAzureCredential()
-            else:
-                if not self._api_key:
-                    raise LLMAuthError("AZURE_AI_KEY not set and USE_AZURE_CREDENTIAL is false")
-                credential = AzureKeyCredential(self._api_key)
-
-            # Create Azure AI client
-            azure_client = ChatCompletionsClient(
-                endpoint=self._endpoint,
-                credential=credential
-            )
-
-            # Wrap in a simple LangChain-compatible interface
-            self._azure_client = azure_client
-
-        except ImportError as e:
-            raise LLMError(
-                f"Missing required packages: {e}. "
-                "Run: pip install azure-ai-inference azure-identity langchain"
-            )
-        except Exception as e:
-            raise LLMError(f"Failed to initialize Azure AI client: {e}")
+        if not USE_AZURE_CREDENTIAL and not self._api_key:
+            raise LLMAuthError("AZURE_AI_KEY not set")
 
     def generate(self, prompt: str, max_tokens: int = 1024, temperature: float = 0.3) -> str:
-        """Generate text using the Azure AI model."""
+        """Generate text using the Azure AI model via REST API."""
         try:
-            from azure.ai.inference.models import SystemMessage, UserMessage
+            # Construct the inference URL with API version
+            # Azure AI Foundry format: {endpoint}/models/{model}/chat/completions?api-version=2024-05-01-preview
+            url = f"{self._endpoint.rstrip('/')}/models/{self._model_id}/chat/completions"
 
-            response = self._azure_client.complete(
-                messages=[
-                    SystemMessage(content="You are a helpful API recommendation assistant."),
-                    UserMessage(content=prompt)
+            # Prepare headers
+            headers = {
+                "Content-Type": "application/json",
+                "api-key": self._api_key,
+            }
+
+            # Prepare query parameters
+            params = {
+                "api-version": "2024-05-01-preview"
+            }
+
+            # Prepare request body
+            payload = {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a helpful API recommendation assistant."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
                 ],
-                model=self._model_id,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
 
-            return response.choices[0].message.content or ""
+            # Make the request
+            response = requests.post(url, headers=headers, params=params, json=payload, timeout=60)
 
+            # Handle error responses
+            if response.status_code == 401:
+                raise LLMAuthError(f"Azure authentication failed: {response.text}")
+            elif response.status_code == 429:
+                raise LLMRateLimitError(f"Azure rate limit exceeded: {response.text}")
+            elif response.status_code >= 400:
+                error_detail = response.text
+                try:
+                    error_json = response.json()
+                    error_detail = error_json.get("error", {}).get("message", error_detail)
+                except:
+                    pass
+                raise LLMError(f"Azure AI error (status {response.status_code}): {error_detail}")
+
+            # Parse response
+            response.raise_for_status()
+            result = response.json()
+
+            # Extract the generated text
+            if "choices" in result and len(result["choices"]) > 0:
+                message = result["choices"][0].get("message", {})
+                return message.get("content", "")
+            else:
+                raise LLMError(f"Unexpected response format: {result}")
+
+        except requests.exceptions.Timeout:
+            raise LLMConnectionError("Request to Azure AI timed out")
+        except requests.exceptions.ConnectionError as e:
+            raise LLMConnectionError(f"Failed to connect to Azure AI: {e}")
+        except LLMError:
+            raise
         except Exception as e:
-            err_str = str(e).lower()
-            if "unauthorized" in err_str or "authentication" in err_str or "credential" in err_str:
-                raise LLMAuthError(f"Azure authentication failed: {e}")
-            if "quota" in err_str or "rate limit" in err_str or "429" in err_str:
-                raise LLMRateLimitError(f"Azure rate limit exceeded: {e}")
-            if "connection" in err_str or "network" in err_str or "timeout" in err_str:
-                raise LLMConnectionError(f"Azure connection error: {e}")
             raise LLMError(f"Azure AI generation error: {e}")
 
     def is_available(self) -> tuple[bool, str]:
@@ -116,20 +123,12 @@ class AzureAIFoundryProvider:
         if not self._endpoint:
             return False, "AZURE_AI_ENDPOINT not set"
         if not USE_AZURE_CREDENTIAL and not self._api_key:
-            return False, "AZURE_AI_KEY not set (or enable USE_AZURE_CREDENTIAL)"
-
-        # Try a test request to verify connectivity
-        try:
-            # Quick health check - just verify the client initializes
-            if self._azure_client is None:
-                return False, "Azure client not initialized"
-            return True, ""
-        except Exception as e:
-            return False, f"Connection test failed: {e}"
+            return False, "AZURE_AI_KEY not set"
+        return True, ""
 
 
 def fetch_available_models(endpoint: Optional[str] = None, api_key: Optional[str] = None) -> list[dict]:
-    """Fetch available models from Azure AI Foundry Model Catalog.
+    """Fetch available models from Azure AI Foundry.
 
     Returns:
         List of dicts with 'model_id' and 'display_name' keys
@@ -140,55 +139,60 @@ def fetch_available_models(endpoint: Optional[str] = None, api_key: Optional[str
     if not endpoint:
         return []
 
-    # Azure AI Foundry model catalog endpoint
-    # The exact endpoint depends on your deployment
-    # This is a generic approach - you may need to adjust based on your Foundry setup
-
+    # Try to fetch models from the Azure AI endpoint
+    # Azure AI Foundry format: {endpoint}/models?api-version=2024-05-01-preview
     try:
-        from azure.ai.inference import ChatCompletionsClient
-        from azure.core.credentials import AzureKeyCredential
-        from azure.identity import DefaultAzureCredential
+        url = f"{endpoint.rstrip('/')}/models"
+        headers = {
+            "api-key": api_key,
+        }
+        params = {
+            "api-version": "2024-05-01-preview"
+        }
 
-        # Try to get model info via the inference API
-        # Note: The model catalog API varies by deployment
-        # For now, we'll return a default set of common models
-        # You can customize this list based on your Foundry deployment
+        response = requests.get(url, headers=headers, params=params, timeout=10)
 
-        models = [
-            {"model_id": "gpt-4", "display_name": "GPT-4"},
-            {"model_id": "gpt-4-turbo", "display_name": "GPT-4 Turbo"},
-            {"model_id": "gpt-4o", "display_name": "GPT-4o"},
-            {"model_id": "gpt-35-turbo", "display_name": "GPT-3.5 Turbo"},
-            {"model_id": "claude-3-5-sonnet", "display_name": "Claude 3.5 Sonnet"},
-            {"model_id": "claude-3-opus", "display_name": "Claude 3 Opus"},
-            {"model_id": "claude-3-haiku", "display_name": "Claude 3 Haiku"},
-            {"model_id": "gemini-1.5-pro", "display_name": "Gemini 1.5 Pro"},
-            {"model_id": "gemini-1.5-flash", "display_name": "Gemini 1.5 Flash"},
-            {"model_id": "llama-3-70b", "display_name": "Llama 3 70B"},
-            {"model_id": "llama-3-8b", "display_name": "Llama 3 8B"},
-            {"model_id": "mistral-large", "display_name": "Mistral Large"},
-            {"model_id": "mistral-small", "display_name": "Mistral Small"},
-        ]
+        if response.status_code == 200:
+            data = response.json()
+            models = []
 
-        # TODO: If your Azure AI Foundry has a model catalog API, fetch from there
-        # Example (adjust based on your actual API):
-        # if USE_AZURE_CREDENTIAL:
-        #     credential = DefaultAzureCredential()
-        # else:
-        #     credential = AzureKeyCredential(api_key)
-        #
-        # catalog_endpoint = f"{endpoint}/models"  # Adjust based on your API
-        # response = requests.get(catalog_endpoint, headers={"Authorization": f"Bearer {api_key}"})
-        # if response.status_code == 200:
-        #     models = response.json().get("models", [])
+            # Parse the models from the response
+            # The exact format depends on your Azure AI Foundry deployment
+            if isinstance(data, dict) and "data" in data:
+                for model in data["data"]:
+                    model_id = model.get("id") or model.get("name")
+                    display_name = model.get("display_name") or model.get("friendly_name") or model_id
+                    if model_id:
+                        models.append({
+                            "model_id": model_id,
+                            "display_name": display_name
+                        })
+            elif isinstance(data, list):
+                for model in data:
+                    model_id = model.get("id") or model.get("name")
+                    display_name = model.get("display_name") or model.get("friendly_name") or model_id
+                    if model_id:
+                        models.append({
+                            "model_id": model_id,
+                            "display_name": display_name
+                        })
 
-        return models
+            if models:
+                return models
 
     except Exception as e:
-        # If model fetching fails, return empty list
-        # The UI will show a warning
         print(f"Warning: Could not fetch models from Azure AI Foundry: {e}")
-        return []
+
+    # Fallback: Return a default list of common models
+    # These are typical models available in Azure AI Foundry
+    return [
+        {"model_id": "gpt-4", "display_name": "GPT-4"},
+        {"model_id": "gpt-4-turbo", "display_name": "GPT-4 Turbo"},
+        {"model_id": "gpt-4o", "display_name": "GPT-4o"},
+        {"model_id": "gpt-4o-mini", "display_name": "GPT-4o Mini"},
+        {"model_id": "gpt-35-turbo", "display_name": "GPT-3.5 Turbo"},
+        {"model_id": "gpt-35-turbo-16k", "display_name": "GPT-3.5 Turbo 16K"},
+    ]
 
 
 def get_provider(model_id: str) -> AzureAIFoundryProvider:
@@ -204,6 +208,6 @@ def check_azure_availability() -> tuple[bool, str]:
     if not endpoint:
         return False, "AZURE_AI_ENDPOINT not set"
     if not USE_AZURE_CREDENTIAL and not api_key:
-        return False, "AZURE_AI_KEY not set (or enable USE_AZURE_CREDENTIAL)"
+        return False, "AZURE_AI_KEY not set"
 
     return True, ""
